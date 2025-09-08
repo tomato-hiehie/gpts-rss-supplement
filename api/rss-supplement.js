@@ -1,8 +1,16 @@
+// Hanmoto（版元ドットコム）の新刊/近刊フィードを取得し、補足用の簡易JSONに整形して返す。
+// 特徴：
+// ・RSS2.0 / Atom 両対応
+// ・Shift_JIS / EUC-JP / UTF-8 を自動判定してデコード
+// ・到達順フォールバック：公式（http→https）→ r.jina.ai（http→https）→ 検索API RSS（R2MODS→MRSS、直/経由）
+// ・days_window 未指定なら新刊の期間フィルタをスキップ（拾いやすい）
+// ・?debug=1 で取得経路とメタ情報を返す
+
 const { XMLParser } = require("fast-xml-parser");
 const { fetch: undiFetch } = require("undici");
 const iconv = require("iconv-lite");
 
-// 1) 新刊・近刊（公式RSS2.0）
+// 公式 新刊/近刊
 const ORIG = {
   shinkan: "http://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "http://www.hanmoto.com/bd/kinkan/feed/"
@@ -11,7 +19,7 @@ const ORIG_HTTPS = {
   shinkan: "https://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "https://www.hanmoto.com/bd/kinkan/feed/"
 };
-// 2) 公開CDNプロキシ（読み取りのみ）
+// 公開プロキシ（読み取り専用）
 const VIA_JINA_HTTP = {
   shinkan: "https://r.jina.ai/http://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "https://r.jina.ai/http://www.hanmoto.com/bd/kinkan/feed/"
@@ -20,28 +28,31 @@ const VIA_JINA_HTTPS = {
   shinkan: "https://r.jina.ai/https://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "https://r.jina.ai/https://www.hanmoto.com/bd/kinkan/feed/"
 };
-// 3) 検索結果フィード（RSS2.0） 例：…/search/index.php?...&action_search_do4feed=true&searchqueryword=〇〇
+// 公式検索API（R2MODS / MRSS）※RSS2.0でXMLを返す
 const SEARCH_BASE = "https://www.hanmoto.com/bd/search/index.php";
-function buildSearchFeedURL(q) {
-  // 代表的な推奨パラメータ（仕様引用）
-  const params = new URLSearchParams({
+function buildSearchUrl(format, q) {
+  const keyword = (q && q.trim()) ? q.trim() : "の"; // q省略時の代替（広く拾える高頻度語）
+  const p = new URLSearchParams({
     enc: "UTF-8",
-    action_search_do4feed: "true",
+    action_search_do4api: "true",
+    format, // "R2MODS" か "MRSS"
     flg_searchmode: "shousai",
-    ORDERBY: "DateShuppan",        // 刊行日
-    ORDERBY2: "DateShotenhatsubai",// 書店発売日
+    ORDERBY: "DateShuppan",
+    ORDERBY2: "DateShotenhatsubai",
     SORTORDER: "DESC",
-    searchqueryword: q || ""       // テーマ語（空でも可）
+    searchqueryword: keyword
   });
-  return `${SEARCH_BASE}?${params.toString()}`;
+  return `${SEARCH_BASE}?${p.toString()}`;
 }
 
-const FETCH_ROUTE = [ORIG, ORIG_HTTPS, VIA_JINA_HTTP, VIA_JINA_HTTPS];
+// 公式ルート → プロキシルート
+const OFFICIAL_ROUTES = [ORIG, ORIG_HTTPS, VIA_JINA_HTTP, VIA_JINA_HTTPS];
 
 const jpNow = () => new Date(Date.now() + 9 * 60 * 60 * 1000);
 const txt = (x) => (x == null ? "" : String(x));
 const onlyDigits = (s) => (s || "").replace(/[^0-9]/g, "");
 
+// 簡易一致スコア（0..1）
 function scoreMatch(q, fields) {
   const terms = (q || "").trim().split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
   if (!terms.length) return 1.0;
@@ -65,15 +76,14 @@ function decodeBuffer(buf, contentTypeHeader) {
   if (!charset || charset === "utf8") charset = "utf-8";
   const map = { "shift-jis": "shift_jis", "sjis": "shift_jis", "shift_jis": "shift_jis", "euc-jp": "euc-jp" };
   const enc = map[charset] || charset;
-  try {
-    return { text: iconv.decode(Buffer.from(buf), enc), detected: enc };
-  } catch {
-    return { text: Buffer.from(buf).toString("utf-8"), detected: "utf-8(fallback)" };
-  }
+
+  try { return { text: iconv.decode(Buffer.from(buf), enc), detected: enc }; }
+  catch { return { text: Buffer.from(buf).toString("utf-8"), detected: "utf-8(fallback)" }; }
 }
 
-// RSS/Atom 正規化
+// RSS/Atom → {mode, items:[{title,link,pubDate,description}]}
 function normalizeParsed(obj) {
+  // RSS2.0
   const rssItems = obj?.rss?.channel?.item;
   if (rssItems) {
     const arr = Array.isArray(rssItems) ? rssItems : [rssItems];
@@ -87,6 +97,7 @@ function normalizeParsed(obj) {
       }))
     };
   }
+  // Atom
   const atomEntries = obj?.feed?.entry;
   if (atomEntries) {
     const arr = Array.isArray(atomEntries) ? atomEntries : [atomEntries];
@@ -97,9 +108,8 @@ function normalizeParsed(obj) {
         if (Array.isArray(en.link)) {
           const alt = en.link.find(l => (l["@_rel"] ?? "alternate") === "alternate") || en.link[0];
           link = txt(alt?.["@_href"]);
-        } else if (typeof en.link === "object") {
-          link = txt(en.link?.["@_href"]);
-        } else link = txt(en.link);
+        } else if (typeof en.link === "object") link = txt(en.link?.["@_href"]);
+        else link = txt(en.link);
         const body = txt(en["content:encoded"] ?? en.content?.["#text"] ?? en.content ?? en.summary ?? "");
         const when = txt(en.updated ?? en.published ?? "");
         return { title: txt(en.title?.["#text"] ?? en.title), link, pubDate: when, description: body };
@@ -109,6 +119,7 @@ function normalizeParsed(obj) {
   return { mode: "none", items: [] };
 }
 
+// 1回取得
 async function fetchOnce(url) {
   const res = await undiFetch(url, {
     headers: {
@@ -119,8 +130,10 @@ async function fetchOnce(url) {
   });
   const ab = await res.arrayBuffer();
   const raw = Buffer.from(ab);
+  // r.jina.ai は text/plain で返すこともあるので、ヘッダは参考程度に
   const { text: xml, detected } = decodeBuffer(raw, res.headers.get("content-type") || "");
   const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+
   let parsed, norm = { mode: "none", items: [] }, parseError = null;
   try {
     parsed = parser.parse(xml);
@@ -140,22 +153,41 @@ async function fetchOnce(url) {
   };
 }
 
-// route: 新刊/近刊 → だめなら 検索結果フィード(q)
+// 公式→プロキシ→検索API(R2MODS→MRSS、直→jina) の順で取得
 async function loadFeedSmart(feedKey, qForSearch) {
-  // 直接→https→jina(http)→jina(https)
-  for (const route of FETCH_ROUTE) {
+  // 1) 公式/プロキシ
+  for (const route of OFFICIAL_ROUTES) {
     const url = route[feedKey];
     try {
       const r = await fetchOnce(url);
       if ((r.status >= 200 && r.status < 300) && r.items.length > 0) {
-        return { used: url, kind: "official", ok: true, ...r };
+        return { used: url, routeKind: "official", ok: true, ...r };
       }
     } catch {}
   }
-  // 検索結果フィードに切替（q が空でも新着が返る）
-  const searchUrl = buildSearchFeedURL(qForSearch);
-  const r = await fetchOnce(searchUrl);
-  return { used: searchUrl, kind: "search", ok: (r.status >= 200 && r.status < 300), ...r };
+  // 2) 検索API（R2MODS → MRSS）
+  for (const fmt of ["R2MODS", "MRSS"]) {
+    const searchUrl = buildSearchUrl(fmt, qForSearch);
+    // 直
+    try {
+      let r = await fetchOnce(searchUrl);
+      if ((r.status >= 200 && r.status < 300) && r.items.length > 0) {
+        return { used: searchUrl, routeKind: `search:${fmt}`, ok: true, ...r };
+      }
+      // Jina 経由
+      const via = "https://r.jina.ai/" + searchUrl.replace(/^https?:\/\//, "");
+      r = await fetchOnce(via);
+      if ((r.status >= 200 && r.status < 300) && r.items.length > 0) {
+        return { used: via, routeKind: `search:${fmt}:jina`, ok: true, ...r };
+      }
+    } catch {}
+  }
+  // 全滅
+  return {
+    used: null, routeKind: "failed", ok: false,
+    status: 0, contentType: "", detectedEncoding: "", bytes: 0,
+    mode: "none", items: [], parseError: "all routes failed", xmlSnippet: ""
+  };
 }
 
 function extractISBN13(link) {
@@ -171,9 +203,11 @@ module.exports = async (req, res) => {
     const q = (url.searchParams.get("q") || "").trim();
     const debugMode = url.searchParams.get("debug") === "1";
 
+    // days_window 未指定(null) → 新刊の期間フィルタをスキップ
     const daysParam = url.searchParams.get("days_window");
     const daysWindow = daysParam == null ? null : Math.min(Math.max(parseInt(daysParam || "14", 10), 1), 90);
 
+    // feeds デフォルト：両方
     const rawFeeds = url.searchParams.getAll("feeds");
     const feeds = (rawFeeds.length ? rawFeeds : ["shinkan", "kinkan"])
       .filter(f => f === "shinkan" || f === "kinkan");
@@ -189,7 +223,7 @@ module.exports = async (req, res) => {
       debug.push({
         feed: f,
         used: r.used,
-        routeKind: r.kind, // "official" or "search"
+        routeKind: r.routeKind,
         ok: r.ok,
         status: r.status,
         contentType: r.contentType,
@@ -205,13 +239,14 @@ module.exports = async (req, res) => {
         const pub = it.pubDate ? new Date(it.pubDate) : null;
         const pubOK = pub instanceof Date && !isNaN(pub);
 
+        // フィルタ
         let keep = true;
         if (f === "shinkan") {
           if (daysWindow !== null) {
             keep = pubOK ? ((now - pub) / 86400000 <= daysWindow && (now - pub) >= 0) : true;
           }
         } else {
-          keep = pubOK ? (pub > now) : true; // 近刊は未来
+          keep = pubOK ? (pub > now) : true; // 近刊は未来日。日付不明は通す
         }
         if (!keep) continue;
 
@@ -230,6 +265,7 @@ module.exports = async (req, res) => {
       }
     }
 
+    // スコア降順 → 日付降順
     out.sort((a, b) => {
       if (b.match_score !== a.match_score) return b.match_score - a.match_score;
       const ta = a.pubDate ? Date.parse(a.pubDate) : 0;
