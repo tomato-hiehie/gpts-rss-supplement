@@ -1,24 +1,60 @@
-// Hanmoto 新刊/近刊を r.jina.ai 経由で取得して補足JSONを返す（直アクセスは500のためプロキシ固定）
-// ・RSS2.0 / Atom 対応
-// ・Shift_JIS / EUC-JP / UTF-8 自動判定
-// ・days_window 未指定なら新刊の期間フィルタをスキップ
-// ・?debug=1 で取得メタを返す
+// Hanmoto（版元ドットコム）補足用RSSアグリゲータ
+// ・RSS2/Atom対応、Shift_JIS/EUC-JP/UTF-8 自動判定
+// ・到達順: 公式新刊/近刊 → r.jina.ai 経由 → 検索結果フィード (do4feed) → 検索API(R2MODS/MRSS) → 各ルートの r.jina.ai
+// ・?days_window= 未指定: 新刊の期間フィルタなし / ?debug=1 で試行ログ返却
 
 const { XMLParser } = require("fast-xml-parser");
 const { fetch: undiFetch } = require("undici");
 const iconv = require("iconv-lite");
 
-// プロキシ固定（直は500のため使わない）
-const FEEDS = {
+// 公式新刊/近刊
+const OFFICIAL = {
+  shinkan: "https://www.hanmoto.com/bd/shinkan/feed/",
+  kinkan:  "https://www.hanmoto.com/bd/kinkan/feed/"
+};
+// 公式を r.jina.ai 経由
+const OFFICIAL_VIA = {
   shinkan: "https://r.jina.ai/https://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "https://r.jina.ai/https://www.hanmoto.com/bd/kinkan/feed/"
 };
+
+// 検索フィード（RSS2.0を返す想定：action_search_do4feed=true）
+const SEARCH_BASE = "https://www.hanmoto.com/bd/search/index.php";
+function buildSearchDo4FeedURL(q) {
+  const keyword = (q && q.trim()) ? q.trim() : "の"; // 空なら高頻度語で代替
+  const p = new URLSearchParams({
+    enc: "UTF-8",
+    action_search_do4feed: "true",
+    flg_searchmode: "shousai",
+    ORDERBY: "DateShuppan",
+    ORDERBY2: "DateShotenhatsubai",
+    SORTORDER: "DESC",
+    searchqueryword: keyword
+  });
+  return `${SEARCH_BASE}?${p.toString()}`;
+}
+function viaJina(u) { return "https://r.jina.ai/" + u.replace(/^https?:\/\//, ""); }
+
+// 検索API（XML：R2MODS or MRSS）
+function buildSearchApiURL(format, q) {
+  const keyword = (q && q.trim()) ? q.trim() : "の";
+  const p = new URLSearchParams({
+    enc: "UTF-8",
+    action_search_do4api: "true",
+    format, // R2MODS or MRSS
+    flg_searchmode: "shousai",
+    ORDERBY: "DateShuppan",
+    ORDERBY2: "DateShotenhatsubai",
+    SORTORDER: "DESC",
+    searchqueryword: keyword
+  });
+  return `${SEARCH_BASE}?${p.toString()}`;
+}
 
 const jpNow = () => new Date(Date.now() + 9 * 60 * 60 * 1000);
 const txt = (x) => (x == null ? "" : String(x));
 const onlyDigits = (s) => (s || "").replace(/[^0-9]/g, "");
 
-// 0..1 簡易一致スコア
 function scoreMatch(q, fields) {
   const terms = (q || "").trim().split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
   if (!terms.length) return 1.0;
@@ -27,17 +63,17 @@ function scoreMatch(q, fields) {
   return hit / terms.length;
 }
 
-// 文字コード自動判定 → UTF-8文字列
+// 自動デコード
 function decodeBuffer(buf, contentTypeHeader) {
   let charset = "";
   if (contentTypeHeader) {
     const m = /charset\s*=\s*("?)([^";\s]+)\1/i.exec(contentTypeHeader);
-    if (m) charset = m[2].toLowerCase();
+    if (m) charset = m[2]?.toLowerCase();
   }
   if (!charset) {
     const probe = Buffer.from(buf.subarray(0, 2048)).toString();
     const m2 = /<\?xml[^>]*encoding=["']([^"']+)["']/i.exec(probe);
-    if (m2) charset = m2[1].toLowerCase();
+    if (m2) charset = m2[1]?.toLowerCase();
   }
   if (!charset || charset === "utf8") charset = "utf-8";
   const map = { "shift-jis": "shift_jis", "sjis": "shift_jis", "shift_jis": "shift_jis", "euc-jp": "euc-jp" };
@@ -48,7 +84,7 @@ function decodeBuffer(buf, contentTypeHeader) {
 
 // RSS/Atom 正規化
 function normalizeParsed(obj) {
-  // RSS2.0
+  // RSS2
   const rssItems = obj?.rss?.channel?.item;
   if (rssItems) {
     const arr = Array.isArray(rssItems) ? rssItems : [rssItems];
@@ -84,7 +120,7 @@ function normalizeParsed(obj) {
   return { mode: "none", items: [] };
 }
 
-async function fetchFeed(url) {
+async function fetchXML(url) {
   const meta = { url, status: null, contentType: null, detectedEncoding: null, bytes: 0, mode: "none", error: null };
   try {
     const r = await undiFetch(url, {
@@ -103,14 +139,13 @@ async function fetchFeed(url) {
     const { text: xml, detected } = decodeBuffer(raw, meta.contentType);
     meta.detectedEncoding = detected;
 
-    const parser = new XMLParser({
-      ignoreAttributes: false,
-      attributeNamePrefix: "@_",
-      allowBooleanAttributes: true,
-      // Atom/RSS混在のエンティティを無難に処理
-      processEntities: true
-    });
+    // 500エラーページを r.jina.ai がプレーンで返すケースを早期判定
+    if (/Internal Server Error/i.test(xml) && /hanmoto\.com/.test(xml)) {
+      meta.error = "upstream-500";
+      return { items: [], meta, xmlSnippet: xml.slice(0, 200) };
+    }
 
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", processEntities: true });
     let parsed;
     try {
       parsed = parser.parse(xml);
@@ -127,13 +162,50 @@ async function fetchFeed(url) {
   }
 }
 
-const txtLower = (s) => (s || "").toLowerCase();
-
 function extractISBN13(link) {
   const d = onlyDigits(link);
   if (d.length < 13) return null;
   const cand = d.slice(-13);
   return cand.length === 13 ? cand : null;
+}
+
+async function tryRoutes(feedKey, q) {
+  const attempts = [];
+
+  // 1) 公式
+  for (const url of [OFFICIAL[feedKey], OFFICIAL_VIA[feedKey]]) {
+    const r = await fetchXML(url);
+    attempts.push(r);
+    if (r.meta.status >= 200 && r.meta.status < 300 && r.items.length > 0) {
+      return { used: url, route: "official", ...r, attempts };
+    }
+  }
+
+  // 2) 検索RSS: do4feed（直 → via）
+  for (const u of [buildSearchDo4FeedURL(q)]) {
+    for (const url of [u, viaJina(u)]) {
+      const r = await fetchXML(url);
+      attempts.push(r);
+      if (r.meta.status >= 200 && r.meta.status < 300 && r.items.length > 0) {
+        return { used: url, route: "search:do4feed", ...r, attempts };
+      }
+    }
+  }
+
+  // 3) 検索API: R2MODS → MRSS（直 → via）
+  for (const fmt of ["R2MODS", "MRSS"]) {
+    const u = buildSearchApiURL(fmt, q);
+    for (const url of [u, viaJina(u)]) {
+      const r = await fetchXML(url);
+      attempts.push(r);
+      if (r.meta.status >= 200 && r.meta.status < 300 && r.items.length > 0) {
+        return { used: url, route: `search:${fmt}`, ...r, attempts };
+      }
+    }
+  }
+
+  // 全滅
+  return { used: null, route: "failed", items: [], attempts };
 }
 
 module.exports = async (req, res) => {
@@ -142,11 +214,9 @@ module.exports = async (req, res) => {
     const q = (url.searchParams.get("q") || "").trim();
     const debugMode = url.searchParams.get("debug") === "1";
 
-    // days_window 未指定(null) → 新刊の期間フィルタなし
     const daysParam = url.searchParams.get("days_window");
     const daysWindow = daysParam == null ? null : Math.min(Math.max(parseInt(daysParam || "14", 10), 1), 90);
 
-    // feeds：デフォルト両方
     const rawFeeds = url.searchParams.getAll("feeds");
     const feeds = (rawFeeds.length ? rawFeeds : ["shinkan", "kinkan"])
       .filter(f => f === "shinkan" || f === "kinkan");
@@ -154,35 +224,45 @@ module.exports = async (req, res) => {
     const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "20", 10), 1), 50);
 
     const now = jpNow();
-    const out = [];
+    const itemsOut = [];
     const dbg = [];
 
     for (const f of feeds) {
-      const r = await fetchFeed(FEEDS[f]);
-      dbg.push({ feed: f, ...r.meta, xmlSnippet: r.xmlSnippet });
+      const r = await tryRoutes(f, q);
+      dbg.push({
+        feed: f,
+        used: r.used,
+        routeKind: r.route,
+        attempts: r.attempts.map(a => ({
+          url: a.meta.url,
+          status: a.meta.status,
+          contentType: a.meta.contentType,
+          bytes: a.meta.bytes,
+          mode: a.meta.mode,
+          error: a.meta.error
+        }))
+      });
 
       for (const it of r.items) {
         const pub = it.pubDate ? new Date(it.pubDate) : null;
         const pubOK = pub instanceof Date && !isNaN(pub);
 
-        // フィルタ
         let keep = true;
         if (f === "shinkan") {
           if (daysWindow !== null) {
             keep = pubOK ? ((now - pub) / 86400000 <= daysWindow && (now - pub) >= 0) : true;
           }
         } else {
-          keep = pubOK ? (pub > now) : true; // 近刊は未来日。日付不明は通す
+          keep = pubOK ? (pub > now) : true; // 近刊は未来。日付不明は通す
         }
         if (!keep) continue;
 
-        // キーワード一致（タイトル＋本文に対して）
         const m = scoreMatch(q, [it.title, it.description]);
         if (q && m === 0) continue;
 
         const isbn13 = extractISBN13(it.link);
 
-        out.push({
+        itemsOut.push({
           feed: f,
           title: it.title,
           link: it.link,
@@ -194,15 +274,14 @@ module.exports = async (req, res) => {
       }
     }
 
-    // スコア降順 → 日付降順
-    out.sort((a, b) => {
+    itemsOut.sort((a, b) => {
       if (b.match_score !== a.match_score) return b.match_score - a.match_score;
       const ta = a.pubDate ? Date.parse(a.pubDate) : 0;
       const tb = b.pubDate ? Date.parse(b.pubDate) : 0;
       return tb - ta;
     });
 
-    const payload = { trace_id: `rss_${Date.now()}`, items: out.slice(0, limit) };
+    const payload = { trace_id: `rss_${Date.now()}`, items: itemsOut.slice(0, limit) };
     if (debugMode) payload.debug = dbg;
 
     res.setHeader("Access-Control-Allow-Origin", "*");
