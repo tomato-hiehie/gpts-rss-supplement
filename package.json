@@ -1,0 +1,9 @@
+{
+  "name": "gpts-rss-supplement",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "fast-xml-parser": "^4.4.1",
+    "undici": "^6.19.8"
+  }
+}

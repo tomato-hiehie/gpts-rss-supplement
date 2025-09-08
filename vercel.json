@@ -1,0 +1,5 @@
+{
+  "version": 2,
+  "builds": [{ "src": "api/rss-supplement.js", "use": "@vercel/node" }],
+  "routes": [{ "src": "/api/rss-supplement", "dest": "/api/rss-supplement.js" }]
+}
