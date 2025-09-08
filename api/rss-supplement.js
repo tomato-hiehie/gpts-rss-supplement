@@ -1,27 +1,47 @@
-// Hanmoto 新刊/近刊の RSS/Atom を取得して正規化して返す
-// ・RSS2 / Atom 両対応
-// ・Shift_JIS / EUC-JP / UTF-8 自動判定
-// ・days_window 未指定なら新刊の期間フィルタをスキップ
-// ・?debug=1 を付けると取得状況を debug セクションに返す（本番応答は items はそのまま）
-
 const { XMLParser } = require("fast-xml-parser");
 const { fetch: undiFetch } = require("undici");
 const iconv = require("iconv-lite");
 
-const FEEDS_PRIMARY = {
+// 1) 新刊・近刊（公式RSS2.0）
+const ORIG = {
   shinkan: "http://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "http://www.hanmoto.com/bd/kinkan/feed/"
 };
-const FEEDS_FALLBACK = {
+const ORIG_HTTPS = {
   shinkan: "https://www.hanmoto.com/bd/shinkan/feed/",
   kinkan:  "https://www.hanmoto.com/bd/kinkan/feed/"
 };
+// 2) 公開CDNプロキシ（読み取りのみ）
+const VIA_JINA_HTTP = {
+  shinkan: "https://r.jina.ai/http://www.hanmoto.com/bd/shinkan/feed/",
+  kinkan:  "https://r.jina.ai/http://www.hanmoto.com/bd/kinkan/feed/"
+};
+const VIA_JINA_HTTPS = {
+  shinkan: "https://r.jina.ai/https://www.hanmoto.com/bd/shinkan/feed/",
+  kinkan:  "https://r.jina.ai/https://www.hanmoto.com/bd/kinkan/feed/"
+};
+// 3) 検索結果フィード（RSS2.0） 例：…/search/index.php?...&action_search_do4feed=true&searchqueryword=〇〇
+const SEARCH_BASE = "https://www.hanmoto.com/bd/search/index.php";
+function buildSearchFeedURL(q) {
+  // 代表的な推奨パラメータ（仕様引用）
+  const params = new URLSearchParams({
+    enc: "UTF-8",
+    action_search_do4feed: "true",
+    flg_searchmode: "shousai",
+    ORDERBY: "DateShuppan",        // 刊行日
+    ORDERBY2: "DateShotenhatsubai",// 書店発売日
+    SORTORDER: "DESC",
+    searchqueryword: q || ""       // テーマ語（空でも可）
+  });
+  return `${SEARCH_BASE}?${params.toString()}`;
+}
+
+const FETCH_ROUTE = [ORIG, ORIG_HTTPS, VIA_JINA_HTTP, VIA_JINA_HTTPS];
 
 const jpNow = () => new Date(Date.now() + 9 * 60 * 60 * 1000);
 const txt = (x) => (x == null ? "" : String(x));
 const onlyDigits = (s) => (s || "").replace(/[^0-9]/g, "");
 
-// 0..1 の簡易一致スコア
 function scoreMatch(q, fields) {
   const terms = (q || "").trim().split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
   if (!terms.length) return 1.0;
@@ -30,7 +50,7 @@ function scoreMatch(q, fields) {
   return hit / terms.length;
 }
 
-// charset を判定して UTF-8 に
+// 文字コード自動判定→UTF-8文字列
 function decodeBuffer(buf, contentTypeHeader) {
   let charset = "";
   if (contentTypeHeader) {
@@ -45,7 +65,6 @@ function decodeBuffer(buf, contentTypeHeader) {
   if (!charset || charset === "utf8") charset = "utf-8";
   const map = { "shift-jis": "shift_jis", "sjis": "shift_jis", "shift_jis": "shift_jis", "euc-jp": "euc-jp" };
   const enc = map[charset] || charset;
-
   try {
     return { text: iconv.decode(Buffer.from(buf), enc), detected: enc };
   } catch {
@@ -53,55 +72,56 @@ function decodeBuffer(buf, contentTypeHeader) {
   }
 }
 
-// RSS/Atom を [{title, link, pubDate, description}], mode: 'rss'|'atom'|'none'
+// RSS/Atom 正規化
 function normalizeParsed(obj) {
-  // RSS2.0
   const rssItems = obj?.rss?.channel?.item;
   if (rssItems) {
     const arr = Array.isArray(rssItems) ? rssItems : [rssItems];
-    const items = arr.map(it => ({
-      title: txt(it.title),
-      link: txt(typeof it.link === "object" ? it.link?.["@_href"] : it.link),
-      pubDate: txt(it.pubDate || it["dc:date"]),
-      description: txt(it["content:encoded"] ?? it.description ?? "")
-    }));
-    return { mode: "rss", items };
+    return {
+      mode: "rss",
+      items: arr.map(it => ({
+        title: txt(it.title),
+        link: txt(typeof it.link === "object" ? it.link?.["@_href"] : it.link),
+        pubDate: txt(it.pubDate || it["dc:date"] || it["dcterms:date"]),
+        description: txt(it["content:encoded"] ?? it.description ?? "")
+      }))
+    };
   }
-  // Atom
   const atomEntries = obj?.feed?.entry;
   if (atomEntries) {
     const arr = Array.isArray(atomEntries) ? atomEntries : [atomEntries];
-    const items = arr.map(en => {
-      let link = "";
-      if (Array.isArray(en.link)) {
-        const alt = en.link.find(l => (l["@_rel"] ?? "alternate") === "alternate") || en.link[0];
-        link = txt(alt?.["@_href"]);
-      } else if (typeof en.link === "object") {
-        link = txt(en.link?.["@_href"]);
-      } else link = txt(en.link);
-      const body = txt(en["content:encoded"] ?? en.content?.["#text"] ?? en.content ?? en.summary ?? "");
-      const when = txt(en.updated ?? en.published ?? "");
-      return { title: txt(en.title?.["#text"] ?? en.title), link, pubDate: when, description: body };
-    });
-    return { mode: "atom", items };
+    return {
+      mode: "atom",
+      items: arr.map(en => {
+        let link = "";
+        if (Array.isArray(en.link)) {
+          const alt = en.link.find(l => (l["@_rel"] ?? "alternate") === "alternate") || en.link[0];
+          link = txt(alt?.["@_href"]);
+        } else if (typeof en.link === "object") {
+          link = txt(en.link?.["@_href"]);
+        } else link = txt(en.link);
+        const body = txt(en["content:encoded"] ?? en.content?.["#text"] ?? en.content ?? en.summary ?? "");
+        const when = txt(en.updated ?? en.published ?? "");
+        return { title: txt(en.title?.["#text"] ?? en.title), link, pubDate: when, description: body };
+      })
+    };
   }
   return { mode: "none", items: [] };
 }
 
-// フィード1本取得（プライマリ → 失敗したらフォールバック）
-async function fetchFeedOnce(url) {
+async function fetchOnce(url) {
   const res = await undiFetch(url, {
     headers: {
-      // 一部のサイトは UA で弾くため一般ブラウザ風に
       "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      "Accept": "application/rss+xml, application/atom+xml, text/xml;q=0.9, */*;q=0.8"
     }
   });
-  const arrayBuf = await res.arrayBuffer();
-  const raw = Buffer.from(arrayBuf);
+  const ab = await res.arrayBuffer();
+  const raw = Buffer.from(ab);
   const { text: xml, detected } = decodeBuffer(raw, res.headers.get("content-type") || "");
-  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", parseTagValue: true });
-  let parsed; let norm = { mode: "none", items: [] }; let parseError = null;
+  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
+  let parsed, norm = { mode: "none", items: [] }, parseError = null;
   try {
     parsed = parser.parse(xml);
     norm = normalizeParsed(parsed);
@@ -111,21 +131,31 @@ async function fetchFeedOnce(url) {
   return {
     status: res.status,
     contentType: res.headers.get("content-type") || "",
-    bytes: raw.length,
     detectedEncoding: detected,
+    bytes: raw.length,
     mode: norm.mode,
     items: norm.items,
     parseError,
-    xmlSnippet: xml.slice(0, 200) // debug 用に先頭だけ
+    xmlSnippet: xml.slice(0, 200)
   };
 }
 
-async function loadFeedSmart(feedKey) {
-  // 1st: http://, 2nd: https://
-  const primary = await fetchFeedOnce(FEEDS_PRIMARY[feedKey]);
-  if (primary.items.length > 0 || primary.status === 200) return { used: "primary", ...primary };
-  const fallback = await fetchFeedOnce(FEEDS_FALLBACK[feedKey]);
-  return { used: "fallback", ...fallback };
+// route: 新刊/近刊 → だめなら 検索結果フィード(q)
+async function loadFeedSmart(feedKey, qForSearch) {
+  // 直接→https→jina(http)→jina(https)
+  for (const route of FETCH_ROUTE) {
+    const url = route[feedKey];
+    try {
+      const r = await fetchOnce(url);
+      if ((r.status >= 200 && r.status < 300) && r.items.length > 0) {
+        return { used: url, kind: "official", ok: true, ...r };
+      }
+    } catch {}
+  }
+  // 検索結果フィードに切替（q が空でも新着が返る）
+  const searchUrl = buildSearchFeedURL(qForSearch);
+  const r = await fetchOnce(searchUrl);
+  return { used: searchUrl, kind: "search", ok: (r.status >= 200 && r.status < 300), ...r };
 }
 
 function extractISBN13(link) {
@@ -151,45 +181,44 @@ module.exports = async (req, res) => {
     const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "20", 10), 1), 50);
 
     const now = jpNow();
-    const itemsOut = [];
-    const debugInfo = [];
+    const out = [];
+    const debug = [];
 
     for (const f of feeds) {
-      const result = await loadFeedSmart(f);
-      debugInfo.push({
+      const r = await loadFeedSmart(f, q);
+      debug.push({
         feed: f,
-        request: result.used,
-        status: result.status,
-        contentType: result.contentType,
-        bytes: result.bytes,
-        encoding: result.detectedEncoding,
-        mode: result.mode,
-        parseError: result.parseError,
-        sampleTitle: result.items[0]?.title || "",
-        xmlSnippet: result.xmlSnippet
+        used: r.used,
+        routeKind: r.kind, // "official" or "search"
+        ok: r.ok,
+        status: r.status,
+        contentType: r.contentType,
+        encoding: r.detectedEncoding,
+        mode: r.mode,
+        bytes: r.bytes,
+        parseError: r.parseError,
+        sampleTitle: r.items[0]?.title || "",
+        xmlSnippet: r.xmlSnippet
       });
 
-      for (const it of result.items) {
+      for (const it of r.items) {
         const pub = it.pubDate ? new Date(it.pubDate) : null;
         const pubOK = pub instanceof Date && !isNaN(pub);
 
         let keep = true;
         if (f === "shinkan") {
           if (daysWindow !== null) {
-            if (pubOK) {
-              const age = (now - pub) / 86400000;
-              keep = age >= 0 && age <= daysWindow;
-            } else keep = true; // 日付不明は通す
+            keep = pubOK ? ((now - pub) / 86400000 <= daysWindow && (now - pub) >= 0) : true;
           }
         } else {
-          keep = pubOK ? pub > now : true; // 近刊は未来、日付不明は通す
+          keep = pubOK ? (pub > now) : true; // 近刊は未来
         }
         if (!keep) continue;
 
         const isbn13 = extractISBN13(it.link);
         const m = scoreMatch(q, [it.title, it.description]);
 
-        itemsOut.push({
+        out.push({
           feed: f,
           title: it.title,
           link: it.link,
@@ -201,16 +230,15 @@ module.exports = async (req, res) => {
       }
     }
 
-    // スコア降順 → 日付降順
-    itemsOut.sort((a, b) => {
+    out.sort((a, b) => {
       if (b.match_score !== a.match_score) return b.match_score - a.match_score;
       const ta = a.pubDate ? Date.parse(a.pubDate) : 0;
       const tb = b.pubDate ? Date.parse(b.pubDate) : 0;
       return tb - ta;
     });
 
-    const payload = { trace_id: `rss_${Date.now()}`, items: itemsOut.slice(0, limit) };
-    if (debugMode) payload.debug = debugInfo;
+    const payload = { trace_id: `rss_${Date.now()}`, items: out.slice(0, limit) };
+    if (debugMode) payload.debug = debug;
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Content-Type", "application/json; charset=utf-8");
